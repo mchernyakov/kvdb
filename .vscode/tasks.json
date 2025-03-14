@@ -10,6 +10,7 @@
                 "-fcolor-diagnostics",
                 "-fansi-escape-codes",
                 "-g",
+                "${workspaceFolder}/common/*.cpp",
                 "${fileDirname}/*.cpp", // "${workspaceFolder}/*.cpp",
                 "-o",
                 "${fileDirname}/build/${fileBasenameNoExtension}"
