@@ -8,10 +8,11 @@
 
 class Util {
 public:
-    static constexpr size_t k_max_msg = 32 << 20;
+    static constexpr size_t k_max_msg = 2 << 12;
+    static constexpr size_t k_max_args = 200 * 1000;
 
-    static int32_t read_full(int fd, uint8_t *buf, size_t n);
-    static int32_t write_all(int fd, const uint8_t *buf, size_t n);
+    static int32_t read_full(int fd, char *buf, size_t n);
+    static int32_t write_all(int fd, const char *buf, size_t n);
 };
 
 #endif  // UTIL_H
