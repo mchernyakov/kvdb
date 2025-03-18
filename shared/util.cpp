@@ -1,4 +1,5 @@
 #include "util.h"
+#include <string>
 
 int32_t Util::read_full(int fd, char *buf, size_t n) {
     while (n > 0) {
@@ -24,4 +25,13 @@ int32_t Util::write_all(int fd, const char *buf, size_t n) {
         buf += rv;
     }
     return 0;
+}
+
+std::string Util::get_result_code(uint32_t value) {
+    switch (value) {
+        case RES_OK: return "RES_OK";
+        case RES_ERR: return "RES_ERR";
+        case RES_NX: return "RES_NX";
+        default: return "UNKNOWN"; // Handle unexpected values
+    }
 }

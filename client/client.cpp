@@ -12,9 +12,10 @@
 #include <unistd.h>
 #include <vector>
 
-constexpr auto k_max_msg = Util::k_max_msg;
+constexpr auto k_max_msg = Util::k_max_msg_client;
 constexpr auto &write_all = Util::write_all;
 constexpr auto &read_full = Util::read_full;
+constexpr auto &get_resp_code = Util::get_result_code;
 
 static void msg(const char *msg) { fprintf(stderr, "%s\n", msg); }
 
@@ -82,7 +83,7 @@ static int32_t read_res(int fd) {
     return -1;
   }
   memcpy(&rescode, &rbuf[4], 4);
-  printf("server says: [%u] %.*s\n", rescode, len - 4, &rbuf[8]);
+  printf("server says: [%s] %.*s\n", get_resp_code(rescode).c_str(), len - 4, &rbuf[8]);
   return 0;
 }
 

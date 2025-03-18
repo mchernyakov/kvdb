@@ -1,11 +1,11 @@
 #include "../shared/util.h"
+#include "hashtable.h"
 #include <arpa/inet.h>
 #include <assert.h>
 #include <cassert>
 #include <cerrno>
 #include <errno.h>
 #include <fcntl.h>
-#include <map>
 #include <netinet/ip.h>
 #include <poll.h>
 #include <stdint.h>
@@ -20,7 +20,10 @@
 #include <unistd.h>
 #include <vector>
 
-constexpr auto k_max_msg = Util::k_max_msg;
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member) ))
+
+constexpr auto k_max_msg = Util::k_max_msg_server;
 constexpr auto k_max_args = Util::k_max_args;
 constexpr auto &write_all = Util::write_all;
 constexpr auto &read_full = Util::read_full;
@@ -122,7 +125,6 @@ static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n,
 // +------+-----+------+-----+------+-----+-----+------+
 // | nstr | len | str1 | len | str2 | ... | len | strn |
 // +------+-----+------+-----+------+-----+-----+------+
-
 static int32_t parse_req(const uint8_t *data, size_t size,
                          std::vector<std::string> &out) {
   const uint8_t *end = data + size;
@@ -150,13 +152,6 @@ static int32_t parse_req(const uint8_t *data, size_t size,
   return 0;
 }
 
-// Response::status
-enum {
-  RES_OK = 0,
-  RES_ERR = 1, // error
-  RES_NX = 2,  // key not found
-};
-
 // +--------+---------+
 // | status | data... |
 // +--------+---------+
@@ -165,24 +160,80 @@ struct Response {
   std::vector<uint8_t> data;
 };
 
-// placeholder; implemented later
-static std::map<std::string, std::string> g_data;
+// global states
+static struct {
+  HMap db; // top-level hashtable
+} g_data;
 
-static void do_request(std::vector<std::string> &cmd, Response &out) {
-  if (cmd.size() == 2 && cmd[0] == "get") {
-    auto it = g_data.find(cmd[1]);
-    if (it == g_data.end()) {
-      out.status = RES_NX; // not found
-      return;
-    }
-    const std::string &val = it->second;
-    out.data.assign(val.begin(), val.end());
-  } else if (cmd.size() == 3 && cmd[0] == "set") {
-    g_data[cmd[1]].swap(cmd[2]);
-  } else if (cmd.size() == 2 && cmd[0] == "del") {
-    g_data.erase(cmd[1]);
+// KV pair for the top-level hashtable
+struct Entry {
+  struct HNode node; // hashtable node
+  std::string key;
+  std::string val;
+};
+
+// equality comparison for `struct Entry`
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+  struct Entry *le = container_of(lhs, struct Entry, node);
+  struct Entry *re = container_of(rhs, struct Entry, node);
+  return le->key == re->key;
+}
+
+// FNV hash
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+  uint32_t h = 0x811C9DC5;
+  for (size_t i = 0; i < len; i++) {
+    h = (h + data[i]) * 0x01000193;
+  }
+  return h;
+}
+
+static void do_get(std::vector<std::string> &cmd, Response &out) {
+  // a dummy `Entry` just for the lookup
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  // hashtable lookup
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!node) {
+    out.status = RES_NX;
+    return;
+  }
+  // copy the value
+  const std::string &val = container_of(node, Entry, node)->val;
+  assert(val.size() <= k_max_msg);
+  out.data.assign(val.begin(), val.end());
+}
+
+static void do_set(std::vector<std::string> &cmd, Response &) {
+  // a dummy `Entry` just for the lookup
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  // hashtable lookup
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (node) {
+    // found, update the value
+    container_of(node, Entry, node)->val.swap(cmd[2]);
   } else {
-    out.status = RES_ERR; // unrecognized command
+    // not found, allocate & insert a new pair
+    Entry *ent = new Entry();
+    ent->key.swap(key.key);
+    ent->node.hcode = key.node.hcode;
+    ent->val.swap(cmd[2]);
+    hm_insert(&g_data.db, &ent->node);
+  }
+}
+
+static void do_del(std::vector<std::string> &cmd, Response &) {
+  // a dummy `Entry` just for the lookup
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  // hashtable delete
+  HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+  if (node) { // deallocate the pair
+    delete container_of(node, Entry, node);
   }
 }
 
@@ -191,6 +242,18 @@ static void make_response(const Response &resp, std::vector<uint8_t> &out) {
   buf_append(out, (const uint8_t *)&resp_len, 4);
   buf_append(out, (const uint8_t *)&resp.status, 4);
   buf_append(out, resp.data.data(), resp.data.size());
+}
+
+static void do_request(std::vector<std::string> &cmd, Response &out) {
+  if (cmd.size() == 2 && cmd[0] == "get") {
+    return do_get(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "set") {
+    return do_set(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "del") {
+    return do_del(cmd, out);
+  } else {
+    out.status = RES_ERR; // unrecognized command
+  }
 }
 
 // process 1 request if there is enough data
