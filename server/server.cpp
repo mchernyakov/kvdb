@@ -1,5 +1,7 @@
+#include "../shared/common.h"
 #include "../shared/util.h"
 #include "hashtable.h"
+#include "zset.h"
 #include <arpa/inet.h>
 #include <assert.h>
 #include <cassert>
@@ -19,8 +21,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <vector>
-
-#define container_of(ptr, T, member) ((T *)((char *)ptr - offsetof(T, member)))
 
 constexpr auto k_max_msg = Util::k_max_msg_server;
 constexpr auto k_max_args = Util::k_max_args;
@@ -127,6 +127,8 @@ static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n,
 enum {
   ERR_UNKNOWN = 1, // unknown command
   ERR_TOO_BIG = 2, // response too big
+  ERR_BAD_TYP = 3, // unexpected value type
+  ERR_BAD_ARG = 4, // bad arguments
 };
 
 // data types of serialized data
@@ -141,12 +143,15 @@ enum {
 
 // help functions for the serialization
 static void buf_append_u8(Buffer &buf, uint8_t data) { buf.push_back(data); }
+
 static void buf_append_u32(Buffer &buf, uint32_t data) {
   buf_append(buf, (const uint8_t *)&data, 4);
 }
+
 static void buf_append_i64(Buffer &buf, int64_t data) {
   buf_append(buf, (const uint8_t *)&data, 8);
 }
+
 static void buf_append_dbl(Buffer &buf, double data) {
   buf_append(buf, (const uint8_t *)&data, 8);
 }
@@ -176,9 +181,21 @@ static void out_err(Buffer &out, uint32_t code, const std::string &msg) {
   buf_append_u32(out, (uint32_t)msg.size());
   buf_append(out, (const uint8_t *)msg.data(), msg.size());
 }
+
 static void out_arr(Buffer &out, uint32_t n) {
   buf_append_u8(out, TAG_ARR);
   buf_append_u32(out, n);
+}
+
+static size_t out_begin_arr(Buffer &out) {
+  out.push_back(TAG_ARR);
+  buf_append_u32(out, 0);     // filled by out_end_arr()
+  return out.size() - 4;      // the `ctx` arg
+}
+
+static void out_end_arr(Buffer &out, size_t ctx, uint32_t n) {
+  assert(out[ctx - 1] == TAG_ARR);
+  memcpy(&out[ctx], &n, 4);
 }
 
 // +------+-----+------+-----+------+-----+-----+------+
@@ -224,32 +241,52 @@ static struct {
   HMap db; // top-level hashtable
 } g_data;
 
+// value types
+enum {
+  T_INIT = 0,
+  T_STR = 1,  // string
+  T_ZSET = 2, // sorted set
+};
+
 // KV pair for the top-level hashtable
 struct Entry {
   struct HNode node; // hashtable node
   std::string key;
-  std::string val;
+  // value
+  uint32_t type = 0;
+  // one of the following
+  std::string str;
+  ZSet zset;
 };
 
-// equality comparison for `struct Entry`
-static bool entry_eq(HNode *lhs, HNode *rhs) {
-  struct Entry *le = container_of(lhs, struct Entry, node);
-  struct Entry *re = container_of(rhs, struct Entry, node);
-  return le->key == re->key;
+static Entry *entry_new(uint32_t type) {
+  Entry *ent = new Entry();
+  ent->type = type;
+  return ent;
 }
 
-// FNV hash
-static uint64_t str_hash(const uint8_t *data, size_t len) {
-  uint32_t h = 0x811C9DC5;
-  for (size_t i = 0; i < len; i++) {
-    h = (h + data[i]) * 0x01000193;
+static void entry_del(Entry *ent) {
+  if (ent->type == T_ZSET) {
+    zset_clear(&ent->zset);
   }
-  return h;
+  delete ent;
+}
+
+struct LookupKey {
+  struct HNode node; // hashtable node
+  std::string key;
+};
+
+// equality comparison for the top-level hashstable
+static bool entry_eq(HNode *node, HNode *key) {
+  struct Entry *ent = container_of(node, struct Entry, node);
+  struct LookupKey *keydata = container_of(key, struct LookupKey, node);
+  return ent->key == keydata->key;
 }
 
 static void do_get(std::vector<std::string> &cmd, Buffer &out) {
-  // a dummy `Entry` just for the lookup
-  Entry key;
+  // a dummy struct just for the lookup
+  LookupKey key;
   key.key.swap(cmd[1]);
   key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
   // hashtable lookup
@@ -258,40 +295,47 @@ static void do_get(std::vector<std::string> &cmd, Buffer &out) {
     return out_nil(out);
   }
   // copy the value
-  const std::string &val = container_of(node, Entry, node)->val;
-  return out_str(out, val.data(), val.size());
+  Entry *ent = container_of(node, Entry, node);
+  if (ent->type != T_STR) {
+    return out_err(out, ERR_BAD_TYP, "not a string value");
+  }
+  return out_str(out, ent->str.data(), ent->str.size());
 }
 
 static void do_set(std::vector<std::string> &cmd, Buffer &out) {
-  // a dummy `Entry` just for the lookup
-  Entry key;
+  // a dummy struct just for the lookup
+  LookupKey key;
   key.key.swap(cmd[1]);
   key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
   // hashtable lookup
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (node) {
     // found, update the value
-    container_of(node, Entry, node)->val.swap(cmd[2]);
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) {
+      return out_err(out, ERR_BAD_TYP, "a non-string value exists");
+    }
+    ent->str.swap(cmd[2]);
   } else {
     // not found, allocate & insert a new pair
-    Entry *ent = new Entry();
+    Entry *ent = entry_new(T_STR);
     ent->key.swap(key.key);
     ent->node.hcode = key.node.hcode;
-    ent->val.swap(cmd[2]);
+    ent->str.swap(cmd[2]);
     hm_insert(&g_data.db, &ent->node);
   }
   return out_nil(out);
 }
 
 static void do_del(std::vector<std::string> &cmd, Buffer &out) {
-  // a dummy `Entry` just for the lookup
-  Entry key;
+  // a dummy struct just for the lookup
+  LookupKey key;
   key.key.swap(cmd[1]);
   key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
   // hashtable delete
   HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
   if (node) { // deallocate the pair
-    delete container_of(node, Entry, node);
+    entry_del(container_of(node, Entry, node));
   }
   return out_int(out, node ? 1 : 0);
 }
@@ -308,19 +352,144 @@ static void do_keys(std::vector<std::string> &, Buffer &out) {
   hm_foreach(&g_data.db, &cb_keys, (void *)&out);
 }
 
-static void response_begin(Buffer &out, size_t *header) {
-  *header = out.size();       // messege header position
-  buf_append_u32(out, 0);     // reserve space
+static bool str2dbl(const std::string &s, double &out) {
+  char *endp = NULL;
+  out = strtod(s.c_str(), &endp);
+  return endp == s.c_str() + s.size() && !isnan(out);
 }
+
+static bool str2int(const std::string &s, int64_t &out) {
+  char *endp = NULL;
+  out = strtoll(s.c_str(), &endp, 10);
+  return endp == s.c_str() + s.size();
+}
+
+// zadd zset score name
+static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
+  double score = 0;
+  if (!str2dbl(cmd[2], score)) {
+    return out_err(out, ERR_BAD_ARG, "expect float");
+  }
+
+  // look up or create the zset
+  LookupKey key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+  Entry *ent = NULL;
+  if (!hnode) { // insert a new key
+    ent = entry_new(T_ZSET);
+    ent->key.swap(key.key);
+    ent->node.hcode = key.node.hcode;
+    hm_insert(&g_data.db, &ent->node);
+  } else { // check the existing key
+    ent = container_of(hnode, Entry, node);
+    if (ent->type != T_ZSET) {
+      return out_err(out, ERR_BAD_TYP, "expect zset");
+    }
+  }
+
+  // add or update the tuple
+  const std::string &name = cmd[3];
+  bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+  return out_int(out, (int64_t)added);
+}
+
+static const ZSet k_empty_zset;
+
+static ZSet *expect_zset(std::string &s) {
+  LookupKey key;
+  key.key.swap(s);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!hnode) { // a non-existent key is treated as an empty zset
+    return (ZSet *)&k_empty_zset;
+  }
+  Entry *ent = container_of(hnode, Entry, node);
+  return ent->type == T_ZSET ? &ent->zset : NULL;
+}
+
+// zrem zset name
+static void do_zrem(std::vector<std::string> &cmd, Buffer &out) {
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset) {
+    return out_err(out, ERR_BAD_TYP, "expect zset");
+  }
+
+  const std::string &name = cmd[2];
+  ZNode *znode = zset_lookup(zset, name.data(), name.size());
+  if (znode) {
+    zset_delete(zset, znode);
+  }
+  return out_int(out, znode ? 1 : 0);
+}
+
+// zscore zset name
+static void do_zscore(std::vector<std::string> &cmd, Buffer &out) {
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset) {
+    return out_err(out, ERR_BAD_TYP, "expect zset");
+  }
+
+  const std::string &name = cmd[2];
+  ZNode *znode = zset_lookup(zset, name.data(), name.size());
+  return znode ? out_dbl(out, znode->score) : out_nil(out);
+}
+
+// zquery zset score name offset limit
+static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
+  // parse args
+  double score = 0;
+  if (!str2dbl(cmd[2], score)) {
+    return out_err(out, ERR_BAD_ARG, "expect fp number");
+  }
+  const std::string &name = cmd[3];
+  int64_t offset = 0, limit = 0;
+  if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
+    return out_err(out, ERR_BAD_ARG, "expect int");
+  }
+
+  // get the zset
+  ZSet *zset = expect_zset(cmd[1]);
+  if (!zset) {
+    return out_err(out, ERR_BAD_TYP, "expect zset");
+  }
+
+  // seek to the key
+  if (limit <= 0) {
+    return out_arr(out, 0);
+  }
+  ZNode *znode = zset_seekge(zset, score, name.data(), name.size());
+  znode = znode_offset(znode, offset);
+
+  // output
+  size_t ctx = out_begin_arr(out);
+  int64_t n = 0;
+  while (znode && n < limit) {
+    out_str(out, znode->name, znode->len);
+    out_dbl(out, znode->score);
+    znode = znode_offset(znode, +1);
+    n += 2;
+  }
+  out_end_arr(out, ctx, (uint32_t)n);
+}
+
+static void response_begin(Buffer &out, size_t *header) {
+  *header = out.size();   // messege header position
+  buf_append_u32(out, 0); // reserve space
+}
+
 static size_t response_size(Buffer &out, size_t header) {
   return out.size() - header - 4;
 }
+
 static void response_end(Buffer &out, size_t header) {
   size_t msg_size = response_size(out, header);
   if (msg_size > k_max_msg) {
-      out.resize(header + 4);
-      out_err(out, ERR_TOO_BIG, "response is too big.");
-      msg_size = response_size(out, header);
+    out.resize(header + 4);
+    out_err(out, ERR_TOO_BIG, "response is too big.");
+    msg_size = response_size(out, header);
   }
   // message header
   uint32_t len = (uint32_t)msg_size;
@@ -336,6 +505,14 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     return do_del(cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "keys") {
     return do_keys(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "zadd") {
+    return do_zadd(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zrem") {
+    return do_zrem(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zscore") {
+    return do_zscore(cmd, out);
+  } else if (cmd.size() == 6 && cmd[0] == "zquery") {
+    return do_zquery(cmd, out);
   } else {
     return out_err(out, ERR_UNKNOWN, "unknown command.");
   }
@@ -345,27 +522,27 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
 static bool try_one_request(Conn *conn) {
   // try to parse the protocol: message header
   if (conn->incoming.size() < 4) {
-      return false;   // want read
+    return false; // want read
   }
   uint32_t len = 0;
   memcpy(&len, conn->incoming.data(), 4);
   if (len > k_max_msg) {
-      msg("too long");
-      conn->want_close = true;
-      return false;   // want close
+    msg("too long");
+    conn->want_close = true;
+    return false; // want close
   }
   // message body
   if (4 + len > conn->incoming.size()) {
-      return false;   // want read
+    return false; // want read
   }
   const uint8_t *request = &conn->incoming[4];
 
   // got one request, do some application logic
   std::vector<std::string> cmd;
   if (parse_req(request, len, cmd) < 0) {
-      msg("bad request");
-      conn->want_close = true;
-      return false;   // want close
+    msg("bad request");
+    conn->want_close = true;
+    return false; // want close
   }
   size_t header_pos = 0;
   response_begin(conn->outgoing, &header_pos);
@@ -374,7 +551,7 @@ static bool try_one_request(Conn *conn) {
 
   // application logic done! remove the request message.
   buf_consume(conn->incoming, 4 + len);
-  return true;        // success
+  return true; // success
 }
 
 // application callback when the socket is writable
