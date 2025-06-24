@@ -3,6 +3,7 @@
 #include "hashtable.h"
 #include "heap.h"
 #include "list.h"
+#include "thread_pool.h"
 #include "zset.h"
 #include <arpa/inet.h>
 #include <assert.h>
@@ -88,6 +89,8 @@ static struct {
   DList idle_list;
   // timers for TTLs
   std::vector<HeapItem> heap;
+  // the thread pool
+  TheadPool thread_pool;
 } g_data;
 
 // append to the back
@@ -298,11 +301,28 @@ static Entry *entry_new(uint32_t type) {
   return ent;
 }
 
-static void entry_del(Entry *ent) {
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
+
+static void entry_del_sync(Entry *ent) {
   if (ent->type == T_ZSET) {
     zset_clear(&ent->zset);
   }
   delete ent;
+}
+
+static void entry_del_func(void *arg) { entry_del_sync((Entry *)arg); }
+
+static void entry_del(Entry *ent) {
+  // unlink it from any data structures
+  entry_set_ttl(ent, -1); // remove from the heap data structure
+  // run the destructor in a thread pool for large data structures
+  size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+  const size_t k_large_container_size = 1000;
+  if (set_size > k_large_container_size) {
+    thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
+  } else {
+    entry_del_sync(ent); // small; avoid context switches
+  }
 }
 
 struct LookupKey {
@@ -427,6 +447,40 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
   const std::string &name = cmd[3];
   bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
   return out_int(out, (int64_t)added);
+}
+
+static void heap_delete(std::vector<HeapItem> &a, size_t pos) {
+  // swap the erased item with the last item
+  a[pos] = a.back();
+  a.pop_back();
+  // update the swapped item
+  if (pos < a.size()) {
+    heap_update(a.data(), pos, a.size());
+  }
+}
+
+static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t) {
+  if (pos < a.size()) {
+    a[pos] = t; // update an existing item
+  } else {
+    pos = a.size();
+    a.push_back(t); // or add a new item
+  }
+  heap_update(a.data(), pos, a.size());
+}
+
+// set or remove the TTL
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
+  if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {
+    // setting a negative TTL means removing the TTL
+    heap_delete(g_data.heap, ent->heap_idx);
+    ent->heap_idx = -1;
+  } else if (ttl_ms >= 0) {
+    // add or update the heap data structure
+    uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
+    HeapItem item = {expire_at, &ent->heap_idx};
+    heap_upsert(g_data.heap, ent->heap_idx, item);
+  }
 }
 
 static const ZSet k_empty_zset;
@@ -730,7 +784,10 @@ static void process_timers() {
 }
 
 int main() {
+  // initialization
   dlist_init(&g_data.idle_list);
+  thread_pool_init(&g_data.thread_pool, 4);
+
   // the listening socket
   int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd < 0) {
